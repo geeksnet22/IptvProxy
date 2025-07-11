@@ -21,6 +21,10 @@ function buildHeaders(mac, referer, token = null) {
   };
 }
 
+app.get('/', (req, res) => {
+  res.send('✅ IPTV Proxy is running');
+});
+
 // 🔐 Handshake endpoint
 app.get('/handshake', async (req, res) => {
   const { portal, mac } = req.query;
