@@ -11,6 +11,10 @@ const http = require('http');
 const https = require('https');
 const { URL } = require('url');
 
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
 // Utility function to build headers dynamically
 function buildHeaders(mac, referer, token = null) {
   let cookie = `mac=${mac}; stb_lang=en; timezone=Europe%2FLondon`;
@@ -104,97 +108,169 @@ function generateM3UFromStalker(stalkerData) {
   return lines.join('\n');
 }
 
-// ▶️ Create stream link
-app.get('/create_link', async (req, res) => {
-  const { portal, mac, token, cmd } = req.query;
-  if (!portal || !mac || !token || !cmd)
-    return res
-      .status(400)
-      .json({ error: 'Missing portal, mac, token, or cmd' });
-
-  const baseUrl = `${portal.replace(/\/$/, '')}/portal.php`;
-  const headers = buildHeaders(mac, `${portal}/c/`, token);
-  const url = `${baseUrl}?type=itv&action=create_link&cmd=${encodeURIComponent(
-    cmd
-  )}&JsHttpRequest=1-xml`;
-
-  try {
-    const response = await axios.get(url, { headers });
-    res.json(response.data);
-  } catch (err) {
-    console.error('❌ Stream link error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/stream', (req, res) => {
+app.get('/kitchen_sink_stream', async (req, res) => {
   const { url, portal, mac, token } = req.query;
   if (!url) return res.status(400).send('Missing url param');
 
-  let streamUrl;
-  try {
-    streamUrl = new URL(url);
-  } catch {
-    return res.status(400).send('Invalid url param');
+  // Unique ID for this stream (based on URL+token)
+  const streamId = crypto
+    .createHash('md5')
+    .update(url + (token || ''))
+    .digest('hex');
+  const tmpDir = path.join('/tmp', `hls_${streamId}`);
+  if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir);
+
+  // If it's an HLS playlist, just proxy and rewrite segment URLs
+  if (url.endsWith('.m3u8')) {
+    const axios = require('axios');
+    try {
+      const headers =
+        portal && mac ? buildHeaders(mac, `${portal}/c/`, token) : {};
+      const response = await axios.get(url, { headers });
+      // Rewrite segment URLs to go through our /kitchen_sink_segment endpoint
+      const rewritten = response.data.replace(
+        /^(?!#)([^\r\n]+\.ts(\?.*)?)$/gm,
+        (line) => {
+          let absUrl = line.trim();
+          if (!absUrl.startsWith('http')) {
+            absUrl = new URL(absUrl, url).toString();
+          }
+          return `/kitchen_sink_segment/${streamId}?segmentUrl=${encodeURIComponent(
+            absUrl
+          )}&portal=${encodeURIComponent(
+            portal || ''
+          )}&mac=${encodeURIComponent(mac || '')}&token=${encodeURIComponent(
+            token || ''
+          )}`;
+        }
+      );
+      res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+      res.send(rewritten);
+    } catch (err) {
+      res.status(500).send('#EXTM3U\n');
+    }
+    return;
   }
 
-  const client = streamUrl.protocol === 'https:' ? https : http;
+  // If it's a .ts or direct stream, transmux to HLS
+  // Write HLS segments to disk
+  const playlistPath = path.join(tmpDir, 'index.m3u8');
+  const segmentPattern = path.join(tmpDir, 'segment_%03d.ts');
 
-  // Build headers for Stalker streams if portal and mac are present
-  let headers = {};
-  if (portal && mac) {
-    headers = buildHeaders(mac, `${portal}/c/`, token);
-  } else {
-    if (req.headers.range) headers['Range'] = req.headers.range;
-    if (req.headers['user-agent'])
-      headers['User-Agent'] = req.headers['user-agent'];
+  // If playlist already exists and is fresh, serve it
+  if (
+    fs.existsSync(playlistPath) &&
+    Date.now() - fs.statSync(playlistPath).mtimeMs < 10000
+  ) {
+    // Rewrite segment URLs in the playlist
+    let playlist = fs.readFileSync(playlistPath, 'utf8');
+    playlist = playlist.replace(
+      /(segment_\d+\.ts)/g,
+      (seg) => `/kitchen_sink_segment/${streamId}?segmentFile=${seg}`
+    );
+    res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+    res.send(playlist);
+    return;
   }
 
-  client
-    .get(url, { headers }, (proxyRes) => {
-      const contentType = proxyRes.headers['content-type'] || '';
-
-      // If it's any m3u8 playlist, rewrite ALL non-comment, non-absolute URLs
-      if (
-        contentType.includes('application/vnd.apple.mpegurl') ||
-        contentType.includes('application/x-mpegURL') ||
-        url.endsWith('.m3u8')
-      ) {
-        let data = '';
-        proxyRes.on('data', (chunk) => (data += chunk));
-        proxyRes.on('end', () => {
-          const rewritten = data.replace(/^(?!#)([^\r\n]+)$/gm, (line) => {
-            let refUrl = line.trim();
-            if (!refUrl.startsWith('http')) {
-              refUrl = new URL(refUrl, url).toString();
-            }
-            // Pass portal/mac/token for Stalker segments
-            let stalkerParams = '';
-            if (portal && mac) {
-              stalkerParams = `&portal=${encodeURIComponent(
-                portal
-              )}&mac=${encodeURIComponent(mac)}`;
-              if (token) stalkerParams += `&token=${encodeURIComponent(token)}`;
-            }
-            return `/stream?url=${encodeURIComponent(refUrl)}${stalkerParams}`;
-          });
-          res.setHeader('Content-Type', contentType);
-          res.send(rewritten);
-        });
-      } else {
-        // For all other streams, just pipe
-        const filteredHeaders = { ...proxyRes.headers };
-        delete filteredHeaders['transfer-encoding'];
-        delete filteredHeaders['content-encoding'];
-        delete filteredHeaders['connection'];
-        res.writeHead(proxyRes.statusCode, filteredHeaders);
-        proxyRes.pipe(res);
+  // Clean up old segments
+  if (fs.existsSync(tmpDir)) {
+    fs.readdirSync(tmpDir).forEach((file) => {
+      if (file.endsWith('.ts') || file.endsWith('.m3u8')) {
+        fs.unlinkSync(path.join(tmpDir, file));
       }
-    })
-    .on('error', (err) => {
-      console.error('Stream proxy error:', err.message);
-      res.status(500).send('Stream proxy error');
     });
+  }
+
+  // Build ffmpeg args
+  const args = [
+    '-y',
+    '-i',
+    url,
+    '-c',
+    'copy',
+    '-f',
+    'hls',
+    '-hls_time',
+    '4',
+    '-hls_list_size',
+    '3',
+    '-hls_flags',
+    'delete_segments',
+    '-hls_segment_filename',
+    segmentPattern,
+    playlistPath,
+  ];
+
+  // Add headers if Stalker
+  if (portal && mac) {
+    const headers = buildHeaders(mac, `${portal}/c/`, token);
+    const headerString = Object.entries(headers)
+      .map(([k, v]) => `${k}: ${v}`)
+      .join('\r\n');
+    args.unshift('-headers', headerString);
+  }
+
+  // Start ffmpeg
+  const ffmpeg = spawn('ffmpeg', args);
+
+  ffmpeg.stderr.on('data', (data) => {
+    // Uncomment for debugging: console.error(`ffmpeg: ${data}`);
+  });
+
+  ffmpeg.on('close', (code) => {
+    // Uncomment for debugging: console.log(`ffmpeg exited with code ${code}`);
+  });
+
+  // Wait for playlist to be generated, then serve it
+  let waited = 0;
+  const waitForPlaylist = setInterval(() => {
+    if (fs.existsSync(playlistPath)) {
+      clearInterval(waitForPlaylist);
+      let playlist = fs.readFileSync(playlistPath, 'utf8');
+      playlist = playlist.replace(
+        /(segment_\d+\.ts)/g,
+        (seg) => `/kitchen_sink_segment/${streamId}?segmentFile=${seg}`
+      );
+      res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+      res.send(playlist);
+    } else if (waited > 5000) {
+      clearInterval(waitForPlaylist);
+      res.status(500).send('#EXTM3U\n');
+    }
+    waited += 100;
+  }, 100);
+});
+
+// Serve HLS segments
+app.get('/kitchen_sink_segment/:streamId', (req, res) => {
+  const { streamId } = req.params;
+  const { segmentFile, segmentUrl, portal, mac, token } = req.query;
+  const tmpDir = path.join('/tmp', `hls_${streamId}`);
+
+  if (segmentFile) {
+    const filePath = path.join(tmpDir, segmentFile);
+    if (fs.existsSync(filePath)) {
+      res.setHeader('Content-Type', 'video/mp2t');
+      fs.createReadStream(filePath).pipe(res);
+    } else {
+      res.status(404).send('Segment not found');
+    }
+  } else if (segmentUrl) {
+    // For HLS sources, proxy the segment with headers if needed
+    const axios = require('axios');
+    const headers =
+      portal && mac ? buildHeaders(mac, `${portal}/c/`, token) : {};
+    axios
+      .get(segmentUrl, { headers, responseType: 'stream' })
+      .then((response) => {
+        res.setHeader('Content-Type', 'video/mp2t');
+        response.data.pipe(res);
+      })
+      .catch(() => res.status(404).send('Segment not found'));
+  } else {
+    res.status(400).send('Missing segment');
+  }
 });
 
 app.listen(PORT, '0.0.0.0', () => {
