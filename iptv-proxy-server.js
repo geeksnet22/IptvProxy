@@ -48,7 +48,7 @@ app.get('/handshake', async (req, res) => {
 
 // 📺 Get all channels
 app.get('/get_all_channels', async (req, res) => {
-  const { portal, mac, token } = req.query;
+  const { portal, mac, token, format } = req.query;
   if (!portal || !mac || !token)
     return res.status(400).json({ error: 'Missing portal, mac, or token' });
 
@@ -58,12 +58,46 @@ app.get('/get_all_channels', async (req, res) => {
 
   try {
     const response = await axios.get(url, { headers });
-    res.json(response.data);
+    if (format === 'm3u') {
+      const channels = response.data?.js?.data || [];
+      const m3u = generateM3UFromStalker(channels);
+      res.set('Content-Type', 'application/x-mpegURL');
+      res.send(m3u);
+    } else {
+      res.json(response.data);
+    }
   } catch (err) {
     console.error('❌ Channel error:', err.message);
-    res.status(500).json({ error: err.message });
+    if (format === 'm3u') {
+      res.status(500).send('#EXTM3U\n');
+    } else {
+      res.status(500).json({ error: err.message });
+    }
   }
 });
+
+function generateM3UFromStalker(stalkerData) {
+  if (!stalkerData || !Array.isArray(stalkerData)) return '#EXTM3U\n';
+
+  const lines = ['#EXTM3U'];
+  stalkerData.forEach((channel) => {
+    const name = channel.name || 'Unknown Channel';
+    const logo = channel.logo || '';
+    let streamUrl = '';
+    if (Array.isArray(channel.cmds) && channel.cmds.length > 0) {
+      streamUrl = channel.cmds[0].url.replace(/^auto\s*/, '');
+    } else if (channel.cmd) {
+      streamUrl = channel.cmd.replace(/^auto\s*/, '');
+    }
+    lines.push(
+      `#EXTINF:-1 tvg-id="" tvg-logo="${logo}" group-title="${
+        channel.genre_str || ''
+      }",${name}`
+    );
+    lines.push(streamUrl);
+  });
+  return lines.join('\n');
+}
 
 // ▶️ Create stream link
 app.get('/create_link', async (req, res) => {
