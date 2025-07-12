@@ -6,6 +6,11 @@ const axios = require('axios');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+const { spawn } = require('child_process');
+const http = require('http');
+const https = require('https');
+const { URL } = require('url');
+
 // Utility function to build headers dynamically
 function buildHeaders(mac, referer, token = null) {
   let cookie = `mac=${mac}; stb_lang=en; timezone=Europe%2FLondon`;
@@ -120,6 +125,76 @@ app.get('/create_link', async (req, res) => {
     console.error('❌ Stream link error:', err.message);
     res.status(500).json({ error: err.message });
   }
+});
+
+app.get('/stream', (req, res) => {
+  const { url, portal, mac, token } = req.query;
+  if (!url) return res.status(400).send('Missing url param');
+
+  let streamUrl;
+  try {
+    streamUrl = new URL(url);
+  } catch {
+    return res.status(400).send('Invalid url param');
+  }
+
+  const client = streamUrl.protocol === 'https:' ? https : http;
+
+  // Build headers for Stalker streams if portal and mac are present
+  let headers = {};
+  if (portal && mac) {
+    headers = buildHeaders(mac, `${portal}/c/`, token);
+  } else {
+    if (req.headers.range) headers['Range'] = req.headers.range;
+    if (req.headers['user-agent'])
+      headers['User-Agent'] = req.headers['user-agent'];
+  }
+
+  client
+    .get(url, { headers }, (proxyRes) => {
+      const contentType = proxyRes.headers['content-type'] || '';
+
+      // If it's any m3u8 playlist, rewrite ALL non-comment, non-absolute URLs
+      if (
+        contentType.includes('application/vnd.apple.mpegurl') ||
+        contentType.includes('application/x-mpegURL') ||
+        url.endsWith('.m3u8')
+      ) {
+        let data = '';
+        proxyRes.on('data', (chunk) => (data += chunk));
+        proxyRes.on('end', () => {
+          const rewritten = data.replace(/^(?!#)([^\r\n]+)$/gm, (line) => {
+            let refUrl = line.trim();
+            if (!refUrl.startsWith('http')) {
+              refUrl = new URL(refUrl, url).toString();
+            }
+            // Pass portal/mac/token for Stalker segments
+            let stalkerParams = '';
+            if (portal && mac) {
+              stalkerParams = `&portal=${encodeURIComponent(
+                portal
+              )}&mac=${encodeURIComponent(mac)}`;
+              if (token) stalkerParams += `&token=${encodeURIComponent(token)}`;
+            }
+            return `/stream?url=${encodeURIComponent(refUrl)}${stalkerParams}`;
+          });
+          res.setHeader('Content-Type', contentType);
+          res.send(rewritten);
+        });
+      } else {
+        // For all other streams, just pipe
+        const filteredHeaders = { ...proxyRes.headers };
+        delete filteredHeaders['transfer-encoding'];
+        delete filteredHeaders['content-encoding'];
+        delete filteredHeaders['connection'];
+        res.writeHead(proxyRes.statusCode, filteredHeaders);
+        proxyRes.pipe(res);
+      }
+    })
+    .on('error', (err) => {
+      console.error('Stream proxy error:', err.message);
+      res.status(500).send('Stream proxy error');
+    });
 });
 
 app.listen(PORT, '0.0.0.0', () => {
